@@ -1,0 +1,27 @@
+cat << 'EOF' > .gitignore
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Data and large checkpoints
+checkpoints/
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Environment variables
+.env
+.env.local
+
+# OS / Editor files
+.DS_Store
+.vscode/
+EOF
