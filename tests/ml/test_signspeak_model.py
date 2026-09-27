@@ -1,42 +1,43 @@
 import torch
 
-from ml.data.preprocessing.frame_sampler import sample_video_frames
-from ml.models.visual_encoder.cnn import VisualEncoder
-from ml.models.temporal_encoder.lstm import TemporalEncoder
-from ml.models.translation.decoder import TranslationDecoder
+from ml.models.signspeak import SignSpeakModel
 
 
-video_path = "data/raw/how2sign/videos/train/raw_videos/DvKS20WKiX4_22-8-rgb_front.mp4"
+def test_signspeak_model():
+    batch_size = 1
+    num_frames = 16
+    vocab_size = 9866
+    target_length = 7
 
-vocab_size = 1000
-target_length = 8
+    model = SignSpeakModel(
+        vocab_size=vocab_size
+    )
 
-frames = sample_video_frames(video_path)
-
-visual_encoder = VisualEncoder()
-temporal_encoder = TemporalEncoder()
-decoder = TranslationDecoder(vocab_size=vocab_size)
-
-with torch.no_grad():
-    visual_features = visual_encoder(frames)
-
-    visual_features = visual_features.unsqueeze(0)
-
-    temporal_features = temporal_encoder(visual_features)
+    video = torch.randn(
+        batch_size,
+        num_frames,
+        3,
+        224,
+        224,
+    )
 
     target_tokens = torch.randint(
         0,
         vocab_size,
-        (1, target_length)
+        (batch_size, target_length),
     )
 
-    logits = decoder(
-        temporal_features,
-        target_tokens
+    logits = model(video, target_tokens)
+
+    assert logits.shape == (
+        batch_size,
+        target_length,
+        vocab_size,
     )
 
-print("Frames:", frames.shape)
-print("Visual features:", visual_features.shape)
-print("Temporal features:", temporal_features.shape)
-print("Target tokens:", target_tokens.shape)
-print("Decoder logits:", logits.shape)
+    print("Output shape:", logits.shape)
+    print("SignSpeak integration test passed")
+
+
+if __name__ == "__main__":
+    test_signspeak_model()
