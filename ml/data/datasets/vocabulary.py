@@ -73,6 +73,7 @@ class Vocabulary:
         sentence = " ".join(tokens)
 
         sentence = re.sub(r"\s+([.,!?;:])", r"\1", sentence)
+        sentence = re.sub(r"\s+(['’])\s*", r"\1", sentence)
         sentence = re.sub(r"([(\[]) ", r"\1", sentence)
         sentence = re.sub(r" ([])])", r"\1", sentence)
 
