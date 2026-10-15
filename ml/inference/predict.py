@@ -1,3 +1,4 @@
+import os
 import torch
 
 from ml.data.datasets.vocabulary import Vocabulary
@@ -67,26 +68,45 @@ def greedy_decode(model, vocabulary, video, device, max_length=50):
     )
 
 
-def predict_video(video_path):
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cpu"
-    )
+def get_default_checkpoint():
+    candidate_overfit = "checkpoints/signspeak_attention_overfit.pt"
+    candidate_best = "checkpoints/signspeak_attention_best.pt"
+    if os.path.exists(candidate_overfit):
+        return candidate_overfit
+    if os.path.exists(candidate_best):
+        return candidate_best
+    return "checkpoints/signspeak.pt"
 
-    model, vocabulary = load_model(
-        "checkpoints/signspeak_attention_best.pt",
-        device
-    )
 
-    video = sample_video_frames(
-        video_path,
-        num_samples=16,
-        image_size=224
-    )
+def predict_video(video_path: str, checkpoint_path: str = None):
+    # Device resolution with safety fallback
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
 
-    return greedy_decode(
-        model,
-        vocabulary,
-        video,
-        device
-    )
+    if checkpoint_path is None:
+        checkpoint_path = get_default_checkpoint()
+
+    try:
+        model, vocabulary = load_model(checkpoint_path, device)
+        video = sample_video_frames(
+            video_path,
+            num_samples=16,
+            image_size=224
+        )
+        return greedy_decode(model, vocabulary, video, device)
+    except Exception as e:
+        # Fall back to CPU if device execution fails
+        if device.type != "cpu":
+            device = torch.device("cpu")
+            model, vocabulary = load_model(checkpoint_path, device)
+            video = sample_video_frames(
+                video_path,
+                num_samples=16,
+                image_size=224
+            )
+            return greedy_decode(model, vocabulary, video, device)
+        raise e
