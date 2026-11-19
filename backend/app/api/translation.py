@@ -41,6 +41,11 @@ async def translate_video(file: UploadFile = File(...)):
             video_info=video_info,
             checkpoint_used=checkpoint_used
         )
+    except RuntimeError as runtime_err:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(runtime_err)
+        )
     except ValueError as val_err:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
