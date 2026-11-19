@@ -57,7 +57,12 @@ class TranslationDecoder(nn.Module):
             vocab_size
         )
 
-    def forward(self, encoder_outputs, target_tokens):
+    def forward(
+        self,
+        encoder_outputs,
+        target_tokens,
+        teacher_forcing_ratio: float = 1.0,
+    ):
 
         batch_size = encoder_outputs.size(0)
 
@@ -79,11 +84,12 @@ class TranslationDecoder(nn.Module):
             encoder_outputs
         )
 
-        embedded = self.embedding(target_tokens)
+        # First decoder input is always the ground-truth BOS token.
+        input_tokens = target_tokens[:, 0]
 
         outputs = []
 
-        for step in range(embedded.size(1)):
+        for step in range(target_tokens.size(1)):
 
             decoder_hidden = hidden[-1].unsqueeze(1)
 
@@ -106,7 +112,9 @@ class TranslationDecoder(nn.Module):
                 encoder_outputs
             )
 
-            current_embedding = embedded[:, step:step + 1, :]
+            current_embedding = self.embedding(
+                input_tokens
+            ).unsqueeze(1)
 
             lstm_input = torch.cat(
                 [
@@ -124,5 +132,23 @@ class TranslationDecoder(nn.Module):
             logits = self.fc(output)
 
             outputs.append(logits)
+
+            # Scheduled sampling: after the first step, occasionally feed the
+            # model's own prediction instead of the ground-truth token. This
+            # exposes the decoder to its own errors and forces the attention
+            # context (i.e. the video) to carry sentence-identifying signal.
+            if step + 1 < target_tokens.size(1):
+                if teacher_forcing_ratio >= 1.0:
+                    input_tokens = target_tokens[:, step + 1]
+                elif teacher_forcing_ratio <= 0.0:
+                    input_tokens = logits[:, -1, :].argmax(
+                        dim=-1
+                    ).detach()
+                elif torch.rand(1).item() < teacher_forcing_ratio:
+                    input_tokens = target_tokens[:, step + 1]
+                else:
+                    input_tokens = logits[:, -1, :].argmax(
+                        dim=-1
+                    ).detach()
 
         return torch.cat(outputs, dim=1)
