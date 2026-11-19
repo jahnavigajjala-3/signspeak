@@ -1,6 +1,19 @@
+"""Controlled multi-video overfitting experiment.
+
+Purpose: establish whether the current architecture and training pipeline
+(video -> CNN -> LSTM -> attention decoder) can memorise several distinct
+How2Sign examples, and whether greedy decoding becomes video-dependent.
+
+This trains a FRESH model from random initialisation on CPU. It does not
+touch the production one-video checkpoint.
+"""
+
 import os
 import random
+import re
+import shutil
 from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,147 +24,251 @@ from ml.data.datasets.collate import make_collate_fn
 from ml.models.signspeak import SignSpeakModel
 from ml.inference.predict import greedy_decode
 from ml.training.checkpoint import save_checkpoint
+from torch.nn.utils.rnn import pad_sequence
+
+SEED = 42
+NUM_EXAMPLES = 10
+NUM_STEPS = 400
+BATCH_SIZE = 4
+LEARNING_RATE = 5e-4
+TF_START = 1.0
+TF_END = 0.4
+CHECKPOINT_PATH = "checkpoints/signspeak_attention_multi_overfit.pt"
+VOCAB_CHECKPOINT = "checkpoints/signspeak_attention_best.pt"
+
+_SENTENCE_NAME_RE = re.compile(r"^(.+)_\d+-\d+-rgb_front$")
 
 
-def set_seed(seed=42):
+def set_seed(seed=SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
-def evaluate_teacher_forced_accuracy(logits, targets, pad_id):
-    preds = logits.argmax(dim=-1)
-    mask = (targets != pad_id)
-    correct = (preds == targets) & mask
-    total_valid = mask.sum().item()
-    if total_valid == 0:
+def video_id_for(sample):
+    """Group sentence clips by the underlying How2Sign video ID."""
+    stem = Path(sample["video_path"]).stem
+    match = _SENTENCE_NAME_RE.match(stem)
+    return match.group(1) if match else stem
+
+
+def token_count(text):
+    return len(re.findall(r"\b\w+\b|[^\w\s]", text))
+
+
+def select_examples(dataset, count):
+    """Deterministic selection of distinct videos with distinct translations."""
+    candidates = []
+    seen_video_ids = set()
+    seen_translations = set()
+
+    for sample in dataset.samples:
+        text = sample["translation"].strip()
+        if not text or token_count(text) < 4:
+            continue
+
+        vid = video_id_for(sample)
+        normalised_text = text.lower()
+
+        if vid in seen_video_ids or normalised_text in seen_translations:
+            continue
+
+        seen_video_ids.add(vid)
+        seen_translations.add(normalised_text)
+        candidates.append(sample)
+
+    rng = random.Random(SEED)
+    rng.shuffle(candidates)
+
+    if len(candidates) < count:
+        raise RuntimeError(
+            f"Only {len(candidates)} distinct candidates available, "
+            f"needed {count}"
+        )
+
+    return candidates[:count]
+
+
+def load_vocabulary(dataset):
+    """Use the existing production vocabulary when available."""
+    if os.path.exists(VOCAB_CHECKPOINT):
+        checkpoint = torch.load(
+            VOCAB_CHECKPOINT,
+            map_location="cpu",
+            weights_only=True,
+        )
+        vocabulary = Vocabulary()
+        vocabulary.word_to_id = checkpoint["word_to_id"]
+        vocabulary.id_to_word = checkpoint["id_to_word"]
+        print(f"Loaded existing vocabulary from {VOCAB_CHECKPOINT}")
+        return vocabulary
+
+    print(
+        f"Vocabulary checkpoint {VOCAB_CHECKPOINT} not found; "
+        "building from train translations (min_frequency=2)"
+    )
+    vocabulary = Vocabulary(min_frequency=2)
+    vocabulary.build(sample["translation"] for sample in dataset.samples)
+    return vocabulary
+
+
+def teacher_forced_accuracy(logits, targets, pad_id):
+    predictions = logits.argmax(dim=-1)
+    mask = targets != pad_id
+    total = mask.sum().item()
+    if total == 0:
         return 0.0
-    return (correct.sum().item() / total_valid) * 100.0
+    correct = (predictions == targets) & mask
+    return correct.sum().item() / total * 100.0
 
 
 def main():
-    set_seed(42)
+    set_seed()
     device = torch.device("cpu")
     print(f"Device: {device}")
     print("Initializing FRESH SignSpeakModel (random initialization)...")
 
-    # Load How2Sign dataset
-    raw_dataset = How2SignDataset(
+    dataset = How2SignDataset(
         root="data/raw/how2sign",
-        split="val",
+        split="train",
         num_samples=16,
         image_size=224,
     )
 
-    # Filter 10 deterministic, distinct samples
-    unique_samples = []
-    seen_translations = set()
-    for sample in raw_dataset.samples:
-        txt = sample["translation"].strip()
-        if txt and txt not in seen_translations and len(txt.split()) >= 3:
-            seen_translations.add(txt)
-            unique_samples.append(sample)
-
-    selected_samples = random.sample(unique_samples, 10)
+    selected_samples = select_examples(dataset, NUM_EXAMPLES)
+    sample_indices = [
+        dataset.samples.index(sample)
+        for sample in selected_samples
+    ]
 
     print("\n==================================================")
-    print("SELECTED TRAINING EXAMPLES (Deterministic Seed = 42)")
+    print(f"SELECTED TRAINING EXAMPLES (seed={SEED})")
     print("==================================================")
-    for idx, s in enumerate(selected_samples):
-        v_name = Path(s["video_path"]).name
-        print(f"[{idx + 1:02d}] Video: {v_name}")
-        print(f"     Path:  {s['video_path']}")
-        print(f"     GT:    \"{s['translation']}\"\n")
+    for idx, sample in enumerate(selected_samples):
+        print(f"[{idx + 1:02d}] Video: {Path(sample['video_path']).name}")
+        print(f"     Video ID: {video_id_for(sample)}")
+        print(f"     GT:       \"{sample['translation']}\"\n")
 
-    # Build vocabulary from selected 10 examples with min_frequency=1
-    vocabulary = Vocabulary(min_frequency=1)
-    vocabulary.build(s["translation"] for s in selected_samples)
-
+    vocabulary = load_vocabulary(dataset)
     pad_id = vocabulary.word_to_id["<PAD>"]
+    bos_id = vocabulary.word_to_id["<BOS>"]
+    eos_id = vocabulary.word_to_id["<EOS>"]
 
     print("==================================================")
     print("VOCABULARY DIAGNOSTICS")
     print("==================================================")
     print(f"Vocab Size: {len(vocabulary)}")
-    print(f"Special Tokens: <PAD>={pad_id}, <BOS>={vocabulary.word_to_id['<BOS>']}, "
-          f"<EOS>={vocabulary.word_to_id['<EOS>']}, <UNK>={vocabulary.word_to_id['<UNK>']}\n")
+    print(
+        f"Special Tokens: <PAD>={pad_id}, <BOS>={bos_id}, "
+        f"<EOS>={eos_id}, <UNK>={vocabulary.word_to_id['<UNK>']}\n"
+    )
 
-    # Instantiate fresh model
     model = SignSpeakModel(vocab_size=len(vocabulary)).to(device)
-
-    # Collate data for selected samples
     collate_fn = make_collate_fn(vocabulary)
-    
-    # Pre-extract frame tensors and tokens for fast in-memory training
-    processed_data = []
+
     print("Pre-loading frame tensors for training samples...")
-    for idx, sample in enumerate(selected_samples):
-        v_tensor, txt = raw_dataset[raw_dataset.samples.index(sample)]
-        videos, dec_in, targets = collate_fn([(v_tensor, txt)])
+    processed_data = []
+    for sample_index, sample in zip(sample_indices, selected_samples):
+        video_tensor, text = dataset[sample_index]
+        videos, decoder_inputs, targets = collate_fn([(video_tensor, text)])
         processed_data.append({
-            "idx": idx,
             "sample": sample,
-            "video_tensor": v_tensor,
-            "video_batch": videos.to(device),
-            "dec_in": dec_in.to(device),
-            "targets": targets.to(device),
-            "gt_text": txt,
+            "video_tensor": video_tensor,
+            "video_batch": videos,
+            "decoder_inputs": decoder_inputs.squeeze(0),
+            "targets": targets.squeeze(0),
+            "text": text,
         })
 
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     print("\n==================================================")
-    print("TRAINING LOOP (CPU)")
+    print("TRAINING LOOP (CPU, scheduled sampling)")
     print("==================================================")
-    
+
     model.train()
-    num_steps = 350
     initial_loss = None
     final_loss = None
+    order = list(range(len(processed_data)))
+    rng = random.Random(SEED)
 
-    for step in range(1, num_steps + 1):
-        total_step_loss = 0.0
+    for step in range(1, NUM_STEPS + 1):
+        progress = (step - 1) / max(1, NUM_STEPS - 1)
+        teacher_forcing_ratio = TF_START + (TF_END - TF_START) * progress
+
+        rng.shuffle(order)
         optimizer.zero_grad()
+        step_loss = 0.0
 
-        for item in processed_data:
-            videos = item["video_batch"]
-            dec_in = item["dec_in"]
-            targets = item["targets"]
+        for start in range(0, len(order), BATCH_SIZE):
+            batch_indices = order[start:start + BATCH_SIZE]
+            batch = [processed_data[i] for i in batch_indices]
 
-            logits = model(videos, dec_in)
+            videos = torch.cat(
+                [item["video_batch"] for item in batch], dim=0
+            )
+            decoder_inputs = pad_sequence(
+                [item["decoder_inputs"] for item in batch],
+                batch_first=True,
+                padding_value=pad_id,
+            )
+            targets = pad_sequence(
+                [item["targets"] for item in batch],
+                batch_first=True,
+                padding_value=pad_id,
+            )
+
+            logits = model(
+                videos,
+                decoder_inputs,
+                teacher_forcing_ratio=teacher_forcing_ratio,
+            )
 
             loss = criterion(
                 logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1)
+                targets.reshape(-1),
             )
 
             loss.backward()
-            total_step_loss += loss.item()
+            step_loss += loss.item() * len(batch)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        avg_loss = total_step_loss / len(processed_data)
+        average_loss = step_loss / len(processed_data)
 
         if step == 1:
-            initial_loss = avg_loss
-            print(f"Step {step:03d} | Initial Loss: {avg_loss:.4f}")
-        elif step % 25 == 0 or step == num_steps:
-            print(f"Step {step:03d} | Loss: {avg_loss:.4f}")
-            final_loss = avg_loss
+            initial_loss = average_loss
+            print(
+                f"Step {step:03d} | Initial Loss: {average_loss:.4f} "
+                f"| teacher_forcing={teacher_forcing_ratio:.2f}"
+            )
+        elif step % 25 == 0 or step == NUM_STEPS:
+            print(
+                f"Step {step:03d} | Loss: {average_loss:.4f} "
+                f"| teacher_forcing={teacher_forcing_ratio:.2f}"
+            )
+            final_loss = average_loss
 
-    # Save fresh checkpoint
     os.makedirs("checkpoints", exist_ok=True)
+    if os.path.exists(CHECKPOINT_PATH):
+        v1_path = CHECKPOINT_PATH.replace(
+            ".pt", "_v1.pt"
+        )
+        if not os.path.exists(v1_path):
+            shutil.copy2(CHECKPOINT_PATH, v1_path)
+            print(f"Preserved previous experiment checkpoint: {v1_path}")
+
     save_checkpoint(
         model=model,
         optimizer=optimizer,
         vocabulary=vocabulary,
-        epoch=num_steps,
+        epoch=NUM_STEPS,
         loss=final_loss,
-        path="checkpoints/signspeak_attention_multi_overfit.pt"
+        path=CHECKPOINT_PATH,
     )
-    print("\nSaved multi-video overfit checkpoint to 'checkpoints/signspeak_attention_multi_overfit.pt'")
+    print(f"Saved multi-video overfit checkpoint to '{CHECKPOINT_PATH}'")
 
     # ==================================================
     # EVALUATION & DIAGNOSTICS
@@ -163,29 +280,58 @@ def main():
     model.eval()
     accuracies = []
     greedy_predictions = []
+    real_losses = []
+    zero_losses = []
 
     for item in processed_data:
-        v_tensor = item["video_tensor"]
-        v_batch = item["video_batch"]
-        dec_in = item["dec_in"]
+        video_tensor = item["video_tensor"]
+        video_batch = item["video_batch"]
+        decoder_inputs = item["decoder_inputs"]
         targets = item["targets"]
-        gt = item["gt_text"]
-        v_name = Path(item["sample"]["video_path"]).name
+        ground_truth = item["text"]
+        video_name = Path(item["sample"]["video_path"]).name
 
         with torch.no_grad():
-            logits = model(v_batch, dec_in)
-            acc = evaluate_teacher_forced_accuracy(logits, targets, pad_id)
-            accuracies.append(acc)
+            logits = model(
+                video_batch, decoder_inputs.unsqueeze(0)
+            )
+            accuracy = teacher_forced_accuracy(
+                logits, targets.unsqueeze(0), pad_id
+            )
+            accuracies.append(accuracy)
 
-            pred_text = greedy_decode(model, vocabulary, v_tensor, device)
-            greedy_predictions.append(pred_text)
+            real_loss = criterion(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+            ).item()
+            real_losses.append(real_loss)
 
-        print(f"VIDEO: {v_name}")
-        print(f"GROUND TRUTH: \"{gt}\"")
-        print(f"GREEDY PREDICTION: \"{pred_text}\"")
-        print(f"TEACHER-FORCED TOKEN ACCURACY: {acc:.2f}%\n")
+            zero_logits = model(
+                torch.zeros_like(video_batch),
+                decoder_inputs.unsqueeze(0),
+            )
+            zero_loss = criterion(
+                zero_logits.reshape(-1, zero_logits.size(-1)),
+                targets.reshape(-1),
+            ).item()
+            zero_losses.append(zero_loss)
 
-    avg_acc = sum(accuracies) / len(accuracies)
+            prediction = greedy_decode(
+                model, vocabulary, video_tensor, device
+            )
+            greedy_predictions.append(prediction)
+
+        print(f"VIDEO: {video_name}")
+        print(f"GROUND TRUTH: \"{ground_truth}\"")
+        print(f"GREEDY PREDICTION: \"{prediction}\"")
+        print(f"TEACHER-FORCED TOKEN ACCURACY: {accuracy:.2f}%")
+        print(
+            f"TF LOSS real/zero video: {real_loss:.4f} / {zero_loss:.4f}\n"
+        )
+
+    average_accuracy = sum(accuracies) / len(accuracies)
+    average_real_loss = sum(real_losses) / len(real_losses)
+    average_zero_loss = sum(zero_losses) / len(zero_losses)
 
     print("==================================================")
     print("SUMMARY METRICS")
@@ -193,8 +339,15 @@ def main():
     print(f"Number of Examples: {len(processed_data)}")
     print(f"Initial Loss: {initial_loss:.4f}")
     print(f"Final Loss:   {final_loss:.4f}")
-    print(f"Average Teacher-Forced Accuracy: {avg_acc:.2f}%")
-    print(f"Unique Greedy Predictions: {len(set(greedy_predictions))} / {len(processed_data)}")
+    print(f"Average Teacher-Forced Accuracy: {average_accuracy:.2f}%")
+    print(
+        f"Average TF Loss real video: {average_real_loss:.4f} "
+        f"| zero video: {average_zero_loss:.4f}"
+    )
+    print(
+        f"Unique Greedy Predictions: "
+        f"{len(set(greedy_predictions))} / {len(processed_data)}"
+    )
     print("==================================================")
 
 
