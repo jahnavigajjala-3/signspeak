@@ -24,4 +24,7 @@ data/processed/*
 # OS / Editor files
 .DS_Store
 .vscode/
+
+# Next.js generated files
+frontend/.next/
 EOF
