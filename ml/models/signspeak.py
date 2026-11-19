@@ -32,7 +32,7 @@ class SignSpeakModel(nn.Module):
             num_layers=num_layers,
         )
 
-    def forward(self, video, target_tokens):
+    def encode_video(self, video):
         batch_size, num_frames, channels, height, width = video.shape
 
         video = video.reshape(
@@ -50,13 +50,15 @@ class SignSpeakModel(nn.Module):
             -1,
         )
 
-        encoder_outputs = self.temporal_encoder(
-            visual_features
-        )
+        return self.temporal_encoder(visual_features)
+
+    def forward(self, video, target_tokens, teacher_forcing_ratio: float = 1.0):
+        encoder_outputs = self.encode_video(video)
 
         logits = self.decoder(
             encoder_outputs,
             target_tokens,
+            teacher_forcing_ratio=teacher_forcing_ratio,
         )
 
         return logits
