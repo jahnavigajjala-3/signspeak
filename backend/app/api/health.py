@@ -9,7 +9,7 @@ router = APIRouter(prefix="/api", tags=["Health"])
 @router.get("/health", response_model=HealthResponse)
 async def check_health():
     default_ckpt = get_default_checkpoint()
-    checkpoint_exists = os.path.exists(default_ckpt)
+    checkpoint_exists = bool(default_ckpt and os.path.exists(default_ckpt))
     device = InferenceService.get_system_device()
 
     return HealthResponse(
