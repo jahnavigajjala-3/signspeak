@@ -75,6 +75,11 @@ class InferenceService:
         sampled_indices = sample_frame_indices(frame_count, 16).tolist()
         
         checkpoint_path = get_default_checkpoint()
+        if not checkpoint_path:
+            raise RuntimeError(
+                "No validated SignSpeak production checkpoint is configured. "
+                "Set SIGNSPEAK_CHECKPOINT to a compatible checkpoint before translating."
+            )
         
         # Execute PyTorch pipeline
         translation = predict_video(video_path, checkpoint_path=checkpoint_path)
